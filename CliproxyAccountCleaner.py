@@ -607,7 +607,7 @@ async def delete_names(base_url, token, names, delete_workers, timeout):
 class EnhancedUI(tk.Tk):
     def __init__(self, conf, config_path):
         super().__init__()
-        self.title("CliproxyAccountCleaner v1.2")
+        self.title("CliproxyAccountCleaner v1.2.1")
         self.geometry("1220x760")
         self.minsize(1080, 640)
 
@@ -1362,7 +1362,7 @@ class EnhancedUI(tk.Tk):
         return str(self.filter_status.get() or "").strip() == "未知"
 
     def _candidate_raw_items(self, rt, only_unknown=False):
-        """返回可检测账号：默认活跃/未知；only_unknown=True 时仅未知。"""
+        """返回可检测账号：默认活跃/未知/错误；only_unknown=True 时仅未知。"""
         target_type = rt["target_type"]
         provider = rt["provider"]
 
@@ -1376,7 +1376,7 @@ class EnhancedUI(tk.Tk):
                 if status not in ("unknown", ""):
                     continue
             else:
-                if status not in ("active", "unknown", ""):
+                if status not in ("active", "unknown", "error", ""):
                     continue
 
             raw = account.get("raw") or {}
@@ -1394,7 +1394,7 @@ class EnhancedUI(tk.Tk):
         return candidates
 
     def _quota_candidate_raw_items(self, rt, only_unknown=False):
-        """额度检测默认检查活跃/未知；unknown筛选时仅检查未知。"""
+        """额度检测默认检查活跃/未知/错误；unknown筛选时仅检查未知。"""
         return self._candidate_raw_items(rt, only_unknown=only_unknown)
 
     def _collect_invalid_names(self, probe_results, quota_results):
@@ -1485,6 +1485,10 @@ class EnhancedUI(tk.Tk):
                 files = fetch_auth_files(rt["base_url"], rt["token"], rt["timeout"])
                 candidates = []
                 for f in files:
+                    status = str(f.get("status") or "unknown").lower()
+                    if status not in ("active", "unknown", "error", ""):
+                        continue
+
                     item_type = str(get_item_type(f) or "").lower()
                     item_provider = str(f.get("provider") or "").lower()
                     if rt["target_type"] and item_type != rt["target_type"]:
@@ -1649,7 +1653,7 @@ class EnhancedUI(tk.Tk):
             if only_unknown:
                 messagebox.showinfo("检查401", "当前筛选为“未知”，没有符合条件（未知、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
             else:
-                messagebox.showinfo("检查401", "没有符合条件（活跃/未知、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
+                messagebox.showinfo("检查401", "没有符合条件（活跃/未知/错误、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
             return
 
         self.action_progress.set(f"正在检查401... 候选={len(candidates)}")
@@ -1724,7 +1728,7 @@ class EnhancedUI(tk.Tk):
             if only_unknown:
                 messagebox.showinfo("额度检测", "当前筛选为“未知”，没有符合条件（未知、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
             else:
-                messagebox.showinfo("额度检测", "没有符合条件（活跃/未知、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
+                messagebox.showinfo("额度检测", "没有符合条件（活跃/未知/错误、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
             return
 
         self.action_progress.set(f"正在检查额度... 候选={len(candidates)}")
@@ -1802,7 +1806,7 @@ class EnhancedUI(tk.Tk):
             if only_unknown:
                 messagebox.showinfo("联合检测", "当前筛选为“未知”，没有符合条件（未知、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
             else:
-                messagebox.showinfo("联合检测", "没有符合条件（活跃/未知、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
+                messagebox.showinfo("联合检测", "没有符合条件（活跃/未知/错误、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
             return
 
         self.action_progress.set(f"正在联合检测... 候选={len(candidates)}")
