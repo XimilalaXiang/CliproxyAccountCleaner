@@ -193,6 +193,23 @@ async def probe_accounts(
     timeout,
     retries,
 ):
+    # 对齐额度检测：先尽量刷新 auth-files，避免使用旧快照导致误判
+    try:
+        refreshed_files = refresh_quota_source(base_url, token, timeout)
+        refreshed_by_auth_index = {}
+        for f in refreshed_files:
+            ai = f.get("auth_index")
+            if ai:
+                refreshed_by_auth_index[ai] = f
+
+        refreshed_candidates = []
+        for item in candidates:
+            ai = item.get("auth_index")
+            refreshed_candidates.append(refreshed_by_auth_index.get(ai) or item)
+    except Exception:
+        # 刷新失败时回退到原候选，避免整次检测中断
+        refreshed_candidates = list(candidates)
+
     async def probe_one(session, sem, item):
         auth_index = item.get("auth_index")
         name = item.get("name") or item.get("id")
@@ -232,6 +249,11 @@ async def probe_accounts(
                         data = safe_json_text(text)
                         sc = data.get("status_code")
                         result["status_code"] = sc
+
+                        # 401 需要二次确认：若允许重试，先重试一次再判失效，避免瞬时误判
+                        if sc == 401 and attempt < retries:
+                            continue
+
                         result["invalid_401"] = (sc == 401)
                         if sc is None:
                             result["error"] = "missing status_code in api-call response"
@@ -251,7 +273,7 @@ async def probe_accounts(
 
     out = []
     async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
-        tasks = [asyncio.create_task(probe_one(session, sem, item)) for item in candidates]
+        tasks = [asyncio.create_task(probe_one(session, sem, item)) for item in refreshed_candidates]
         for t in asyncio.as_completed(tasks):
             out.append(await t)
     return out
@@ -623,7 +645,7 @@ async def delete_names(base_url, token, names, delete_workers, timeout):
 class EnhancedUI(tk.Tk):
     def __init__(self, conf, config_path):
         super().__init__()
-        self.title("CliproxyAccountCleaner v1.2.1")
+        self.title("CliproxyAccountCleaner v1.2.2")
         self.geometry("1220x760")
         self.minsize(1080, 640)
 
@@ -1134,14 +1156,14 @@ class EnhancedUI(tk.Tk):
                     raw_status = f.get("status")
                     normalized_status = raw_status or "unknown"
                     stream_error_active = _is_stream_error_active(raw_status, status_msg)
-                    if (
-                        is_incremental_refresh
-                        and identity
-                        and identity not in previous_ids
-                        and str(normalized_status).lower() == "active"
-                    ):
-                        # 新增账号默认标记为未知，等待后续检测结果再判断
+
+                    prev = previous_state_by_id.get(identity) or {}
+                    pending_scan = bool(prev.get("_pending_scan", False))
+
+                    if is_incremental_refresh and identity and identity not in previous_ids:
+                        # 新增账号默认标记为未知，且在完成扫描前保持未知
                         normalized_status = "unknown"
+                        pending_scan = True
 
                     if normalized_status == "error" and status_msg:
                         parsed = safe_json_text(status_msg)
@@ -1153,13 +1175,18 @@ class EnhancedUI(tk.Tk):
                             except Exception:
                                 pass
 
-                    prev = previous_state_by_id.get(identity) or {}
+                    # 新增账号在未扫描前保持未知，避免仅刷新就被接口状态覆盖
+                    if pending_scan:
+                        account_status = "unknown"
+                    else:
+                        # 保留上一轮扫描得到的状态（active/error），仅当账号从未被扫描时才使用 normalized_status
+                        account_status = prev.get("status") if prev.get("status") in ("active", "error") else normalized_status
 
                     accounts.append(
                         {
                             "name": f.get("name") or "",
                             "account": f.get("account") or f.get("email") or "",
-                            "status": normalized_status,
+                            "status": account_status,
                             "stream_error_active": stream_error_active,
                             "error_info": error_info,
                             "usage_limit": usage_limit,
@@ -1178,6 +1205,7 @@ class EnhancedUI(tk.Tk):
                             "quota_source": prev.get("quota_source"),
                             "reset_at": prev.get("reset_at"),
                             "check_error": prev.get("check_error"),
+                            "_pending_scan": pending_scan,
                             "_selected": True,
                             "_identity": identity,
                             "raw": f,
@@ -1213,6 +1241,20 @@ class EnhancedUI(tk.Tk):
         self.status_bar.set(
             "双击行可切换勾选；可执行检查401/额度，关闭选中或恢复已关闭（PATCH /auth-files/status），删除选中（DELETE）。"
         )
+
+    def _apply_scan_status(self, account, status_code):
+        if status_code is None:
+            # 已参与扫描但响应缺少状态码：记为错误，避免继续停留在未知列表
+            account["status"] = "error"
+            account["stream_error_active"] = False
+            account["_pending_scan"] = False
+            return
+        if status_code == 200:
+            account["status"] = "active"
+        else:
+            account["status"] = "error"
+        account["stream_error_active"] = False
+        account["_pending_scan"] = False
 
     def _display_status(self, account):
         if account.get("disabled"):
@@ -1721,6 +1763,7 @@ class EnhancedUI(tk.Tk):
             if not r:
                 continue
             account["invalid_401"] = bool(r.get("invalid_401"))
+            self._apply_scan_status(account, r.get("status_code"))
             account["check_error"] = r.get("error")
             if account["invalid_401"]:
                 invalid_count += 1
@@ -1798,6 +1841,7 @@ class EnhancedUI(tk.Tk):
             if not r:
                 continue
             account["invalid_quota"] = bool(r.get("invalid_quota"))
+            self._apply_scan_status(account, r.get("status_code"))
             account["used_percent"] = r.get("used_percent")
             account["primary_used_percent"] = r.get("primary_used_percent")
             account["primary_reset_at"] = r.get("primary_reset_at")
@@ -1899,6 +1943,7 @@ class EnhancedUI(tk.Tk):
 
             if p:
                 account["invalid_401"] = bool(p.get("invalid_401"))
+                self._apply_scan_status(account, p.get("status_code"))
                 if account["invalid_401"]:
                     count_401 += 1
                 if p.get("error"):
@@ -1906,6 +1951,8 @@ class EnhancedUI(tk.Tk):
 
             if q:
                 account["invalid_quota"] = bool(q.get("invalid_quota"))
+                if not p:
+                    self._apply_scan_status(account, q.get("status_code"))
                 account["used_percent"] = q.get("used_percent")
                 account["primary_used_percent"] = q.get("primary_used_percent")
                 account["primary_reset_at"] = q.get("primary_reset_at")
