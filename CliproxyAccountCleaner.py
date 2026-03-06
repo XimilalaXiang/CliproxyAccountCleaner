@@ -17,7 +17,7 @@ import urllib.parse
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import requests
 import aiohttp
 
@@ -172,6 +172,29 @@ def fetch_auth_files(base_url, token, timeout):
     )
     r.raise_for_status()
     return safe_json(r).get("files") or []
+
+
+async def download_auth_file_contents(base_url, token, names, workers, timeout):
+    async def fetch_one(session, sem, name):
+        encoded = urllib.parse.quote(name, safe="")
+        url = f"{base_url}/v0/management/auth-files/download?name={encoded}"
+        try:
+            async with sem:
+                async with session.get(url, headers=mgmt_headers(token), timeout=timeout) as resp:
+                    text = await resp.text()
+                    if resp.status == 200:
+                        data = safe_json_text(text)
+                        return {"name": name, "ok": True, "data": data, "error": None}
+                    return {"name": name, "ok": False, "data": None, "error": f"HTTP {resp.status}"}
+        except Exception as e:
+            return {"name": name, "ok": False, "data": None, "error": str(e)}
+
+    connector = aiohttp.TCPConnector(limit=max(1, workers), limit_per_host=max(1, workers))
+    client_timeout = aiohttp.ClientTimeout(total=max(1, timeout))
+    sem = asyncio.Semaphore(max(1, workers))
+    async with aiohttp.ClientSession(connector=connector, timeout=client_timeout) as session:
+        tasks = [fetch_one(session, sem, n) for n in names]
+        return await asyncio.gather(*tasks)
 
 
 def refresh_quota_source(base_url, token, timeout):
@@ -1006,7 +1029,8 @@ class EnhancedUI(tk.Tk):
         ttk.Button(ops_row, text="恢复已关闭", command=self.recover_closed_accounts, style="Neutral.TButton").pack(side="left", padx=6)
         ttk.Button(ops_row, text="加入备用池", command=self.add_selected_to_standby, style="Neutral.TButton").pack(side="left", padx=6)
         ttk.Button(ops_row, text="备用转活跃", command=self.remove_selected_from_standby, style="Neutral.TButton").pack(side="left", padx=6)
-        ttk.Button(ops_row, text="永久删除", command=self.delete_selected, style="Danger.TButton").pack(side="left", padx=(6, 0))
+        ttk.Button(ops_row, text="永久删除", command=self.delete_selected, style="Danger.TButton").pack(side="left", padx=6)
+        ttk.Button(ops_row, text="导出选中", command=self.export_selected, style="Neutral.TButton").pack(side="left", padx=(0, 0))
 
         self.action_progress = tk.StringVar(value="")
         ttk.Label(ops, textvariable=self.action_progress, style="Subtle.TLabel").pack(fill="x", pady=(6, 0))
@@ -2069,6 +2093,65 @@ class EnhancedUI(tk.Tk):
 
     def _selected_names(self):
         return [a.get("name") for a in self.filtered_accounts if a.get("_selected") and a.get("name")]
+
+    def export_selected(self):
+        selected = [a for a in self.filtered_accounts if a.get("_selected") and a.get("name")]
+        if not selected:
+            messagebox.showinfo("导出", "你没有选择任何账号。")
+            return
+        names = [a["name"] for a in selected if not a.get("raw", {}).get("runtime_only")]
+        if not names:
+            messagebox.showinfo("导出", "选中的账号均为 runtime_only，无法下载认证文件。")
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出选中账号",
+            defaultextension=".json",
+            filetypes=[("JSON 文件", "*.json")],
+            initialfile="exported_accounts.json",
+        )
+        if not path:
+            return
+        try:
+            rt = self._runtime()
+        except Exception as e:
+            messagebox.showerror("参数错误", str(e))
+            return
+        self.action_progress.set(f"正在下载 {len(names)} 个账号的认证文件...")
+
+        def worker():
+            try:
+                results = asyncio.run(
+                    download_auth_file_contents(rt["base_url"], rt["token"], names, rt["workers"], rt["timeout"])
+                )
+                self.after(0, self._export_done, results, path)
+            except Exception as e:
+                self.after(0, messagebox.showerror, "导出失败", str(e))
+                self.after(0, self.action_progress.set, "导出失败")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _export_done(self, results, path):
+        ok_data = [r["data"] for r in results if r.get("ok") and r.get("data")]
+        failed = [r for r in results if not r.get("ok")]
+        if not ok_data:
+            messagebox.showerror("导出失败", "所有账号下载均失败。")
+            self.action_progress.set("导出失败")
+            return
+        try:
+            write_json_file(path, ok_data)
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+            self.action_progress.set("导出失败")
+            return
+        msg = f"已导出 {len(ok_data)} 个账号至:\n{path}"
+        if failed:
+            msg += f"\n\n{len(failed)} 个账号下载失败："
+            for r in failed[:10]:
+                msg += f"\n- {r.get('name')}: {r.get('error')}"
+            if len(failed) > 10:
+                msg += f"\n... 还有 {len(failed)-10} 条"
+        self.action_progress.set(f"导出完成：成功={len(ok_data)} 失败={len(failed)}")
+        messagebox.showinfo("导出结果", msg)
 
     def add_selected_to_standby(self):
         names = self._selected_names()
